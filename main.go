@@ -2,18 +2,22 @@ package main
 
 import (
 	"bingoviewer/entle"
+	"encoding/json"
 	"errors"
 	"fmt"
 	stick "github.com/76creates/stickers"
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/reflow/wordwrap"
 	"github.com/nokusukun/bingo"
 	"github.com/sqweek/dialog"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const RESIZE_TICK = 150
@@ -31,6 +35,9 @@ type keyMap struct {
 	Escape key.Binding
 	Tab    key.Binding
 	Open   key.Binding
+	Enter  key.Binding
+	PgUp   key.Binding
+	PgDn   key.Binding
 }
 
 // ShortHelp returns keybindings to be shown in the mini help view. It's part
@@ -43,8 +50,9 @@ func (k keyMap) ShortHelp() []key.Binding {
 // key.Map interface.
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Up, k.Down, k.Left, k.Right, k.Tab}, // first column
-		{k.Open, k.Help, k.Quit},               // second column
+		{k.Tab, k.Enter, k.PgUp, k.PgDn},
+		{k.Up, k.Down, k.Left, k.Right}, // first column
+		{k.Open, k.Help, k.Quit},        // second column
 	}
 }
 
@@ -83,11 +91,23 @@ var keys = keyMap{
 	),
 	Tab: key.NewBinding(
 		key.WithKeys("tab", "shift+tab"),
-		key.WithHelp("[shift]/tab", "switch between collections"),
+		key.WithHelp("[shift]/tab", "switch collections"),
 	),
 	Open: key.NewBinding(
 		key.WithKeys("o"),
 		key.WithHelp("o", "open database"),
+	),
+	Enter: key.NewBinding(
+		key.WithKeys("enter"),
+		key.WithHelp("enter", "view record"),
+	),
+	PgUp: key.NewBinding(
+		key.WithKeys("pgup"),
+		key.WithHelp("pg up", "go up one page"),
+	),
+	PgDn: key.NewBinding(
+		key.WithKeys("pgdown"),
+		key.WithHelp("pg down", "go down one page"),
 	),
 }
 
@@ -119,20 +139,24 @@ func (m Message) FullRender() string {
 }
 
 type Model struct {
-	DatabaseFile    string
-	driver          *bingo.Driver
-	help            help.Model
-	keys            keyMap
-	window          screen
-	state           State
-	messages        []Message
-	lastMsg         int
-	showAllMessages bool
-	activeTab       int
-	collections     []string
-	columns         [][]string
-	rowData         [][]any
-	table           *stick.Table
+	DatabaseFile     string
+	driver           *bingo.Driver
+	help             help.Model
+	keys             keyMap
+	window           screen
+	state            State
+	messages         []Message
+	lastMsg          int
+	showAllMessages  bool
+	activeCollection int
+	collections      []string
+	columns          [][]string
+	rowData          [][]any
+	cleanRowData     [][]any
+	table            *stick.Table
+
+	showRecord bool
+	viewport   viewport.Model
 }
 
 func NewModel() Model {
@@ -226,6 +250,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.table.CursorLeft()
 		case key.Matches(msg, m.keys.Right):
 			m.table.CursorRight()
+		case key.Matches(msg, m.keys.PgUp):
+			for i := 0; i < m.window.height-8; i++ {
+				m.table.CursorUp()
+			}
+		case key.Matches(msg, m.keys.PgDn):
+			for i := 0; i < m.window.height-8; i++ {
+				m.table.CursorDown()
+			}
 		case key.Matches(msg, m.keys.Help):
 			cmd = tea.Batch(cmd, resizeTick())
 			m.help.ShowAll = !m.help.ShowAll
@@ -236,15 +268,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.F1):
 			m.showAllMessages = !m.showAllMessages
 		case key.Matches(msg, m.keys.Escape):
+			m.showRecord = false
 			return m, m.ClearInfoAfter("10ms")
 		case key.Matches(msg, m.keys.Tab):
 			if m.collections == nil {
 				break
 			}
 			if msg.String() == "shift+tab" {
-				m.activeTab = (m.activeTab - 1) % len(m.collections)
-				if m.activeTab < 0 {
-					m.activeTab = len(m.collections) - 1
+				m.activeCollection = (m.activeCollection - 1) % len(m.collections)
+				if m.activeCollection < 0 {
+					m.activeCollection = len(m.collections) - 1
 				}
 				err := m.getData()
 				if err != nil {
@@ -252,11 +285,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				break
 			}
-			m.activeTab = (m.activeTab + 1) % len(m.collections)
+			m.activeCollection = (m.activeCollection + 1) % len(m.collections)
 			err := m.getData()
 			if err != nil {
 				m.Error(fmt.Sprintf("Failed to get columns: %v", err))
 			}
+		case key.Matches(msg, m.keys.Enter):
+			if m.DatabaseFile == "" {
+				break
+			}
+			if len(m.rowData) == 0 {
+				break
+			}
+			m.showRecord = !m.showRecord
 		case key.Matches(msg, m.keys.Quit):
 			//m.quitting = true
 			return m, tea.Quit
@@ -333,7 +374,7 @@ func (m Model) RenderTabs() string {
 
 	var tabs strings.Builder
 	for i, coll := range m.collections {
-		if m.activeTab == i {
+		if m.activeCollection == i {
 			tabs.WriteString(activeTabStyle.Render(fmt.Sprintf("%v", coll)))
 		} else {
 			tabs.WriteString(tabStyle.Render(fmt.Sprintf("%v", coll)))
@@ -348,8 +389,28 @@ func (kmap) Key() []byte {
 	return nil
 }
 
+func (m *Model) lookup(row int) kmap {
+	rowDoc := m.rowData[row]
+	collection := bingo.CollectionFrom[kmap](m.driver, m.collections[m.activeCollection])
+	res := collection.Query(bingo.Query[kmap]{
+		Filter: func(doc kmap) bool {
+			for i, col := range m.columns {
+				for _, colname := range col {
+					if val, ok := doc[colname]; ok {
+						if fmt.Sprintf("%v", val) != rowDoc[i] {
+							return false
+						}
+					}
+				}
+			}
+			return true
+		},
+	})
+	return *res.First()
+}
+
 func (m *Model) getData() error {
-	cols, err := m.driver.FieldsOf(m.collections[m.activeTab])
+	cols, err := m.driver.FieldsOf(m.collections[m.activeCollection])
 	if err != nil {
 		return err
 	}
@@ -357,7 +418,8 @@ func (m *Model) getData() error {
 	m.columns = cols
 	loadErr := ""
 	var orderedRows [][]any
-	collection := bingo.CollectionFrom[kmap](m.driver, m.collections[m.activeTab])
+	var cleanOrderedRows [][]any
+	collection := bingo.CollectionFrom[kmap](m.driver, m.collections[m.activeCollection])
 	collection.Query(bingo.Query[kmap]{
 		Filter: func(doc kmap) bool {
 			return true
@@ -365,17 +427,26 @@ func (m *Model) getData() error {
 	}).Iter(func(docPtr *kmap) error {
 		doc := *docPtr
 		var row []any
+		var cleanRow []any
 		for _, colnames := range m.columns {
 			added := false
 			for _, colname := range colnames {
 				if val, ok := doc[colname]; ok {
-					row = append(row, fmt.Sprintf("%v", val))
+					v := strings.Map(func(r rune) rune {
+						if unicode.IsPrint(r) {
+							return r
+						}
+						return -1
+					}, fmt.Sprintf("%v", val))
+					row = append(row, v)
+					cleanRow = append(cleanRow, val)
 					added = true
 					break
 				}
 			}
 			if !added {
 				row = append(row, "(None)")
+				cleanRow = append(cleanRow, nil)
 			}
 		}
 		if len(row) != len(m.columns) {
@@ -383,6 +454,7 @@ func (m *Model) getData() error {
 			return nil
 		}
 		orderedRows = append(orderedRows, row)
+		cleanOrderedRows = append(cleanOrderedRows, cleanRow)
 		return nil
 	})
 	if loadErr != "" {
@@ -390,6 +462,7 @@ func (m *Model) getData() error {
 	}
 	m.Info(fmt.Sprintf("Loaded %v row(s)", len(orderedRows)))
 	m.rowData = orderedRows
+	m.cleanRowData = cleanOrderedRows
 
 	m.table = stick.NewTable(0, 0, m.Headers())
 	m.table.SetStyles(map[stick.TableStyleKey]lipgloss.Style{
@@ -410,6 +483,54 @@ func (m Model) Headers() []string {
 		h = append(h, col[0])
 	}
 	return h
+}
+
+func (m *Model) RenderDocumentView() string {
+	if len(m.rowData) == 0 {
+		return "No row data"
+	}
+
+	m.viewport.Width = m.window.width - 2
+	m.viewport.Height = m.window.height - 8
+	_, y := m.table.GetCursorLocation()
+	doc := m.cleanRowData[y]
+	var content = strings.Builder{}
+	// get the widest column text width
+	maxWidth := 0
+	for _, colAlias := range m.columns {
+		for _, colname := range colAlias {
+			if len(colname) > maxWidth {
+				maxWidth = len(colname)
+			}
+		}
+	}
+
+	for i, colAliases := range m.columns {
+		//hasWritten := false
+		//for _, colname := range colAliases {
+		colname := colAliases[len(colAliases)-1]
+		v := doc[i]
+		r, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			return errorStyle.Render(err.Error())
+		}
+		key := logoStyle.Render(colname)
+		val := strings.Map(func(r rune) rune {
+			if unicode.IsPrint(r) {
+				return r
+			}
+			return -1
+		}, string(r))
+		if val == "null" {
+			val = lipgloss.NewStyle().Foreground(lipgloss.Color("#474747")).Render(val)
+		}
+		content.WriteString(fmt.Sprintf("%v%v : %v\n", key, strings.Repeat(" ", maxWidth-len(colname)), val))
+	}
+
+	top := fmt.Sprintf("Table: %v [%v/%v]", m.collections[m.activeCollection], y+1, len(m.rowData))
+	c := wordwrap.String(content.String(), m.viewport.Width-4)
+	m.viewport.SetContent(fmt.Sprintf("%v\n\n%v", top, c))
+	return m.viewport.View()
 }
 
 func (m *Model) RenderTable() string {
@@ -460,7 +581,8 @@ func (m Model) View() string {
 	center := stick.NewFlexBox(m.window.width, m.window.height-5)
 	content := lipgloss.Place(center.GetWidth(), center.GetHeight(), lipgloss.Center, lipgloss.Center, "Start by opening a database with [o]")
 
-	if m.showAllMessages {
+	switch {
+	case m.showAllMessages:
 		var messages []string
 		// reverse iterate through messages
 		for i := len(m.messages) - 1; i >= 0; i-- {
@@ -468,9 +590,14 @@ func (m Model) View() string {
 			messages = append(messages, msg.FullRender())
 		}
 		content = lipgloss.JoinVertical(lipgloss.Top, messages...)
-	} else {
-		if m.DatabaseFile != "" {
-			//content = "Loading..."
+	case m.DatabaseFile != "":
+		switch {
+		case m.showRecord:
+			content = lipgloss.JoinVertical(lipgloss.Top,
+				m.RenderTabs(),
+				tableBorderStyle.Width(m.window.width-2).Render(m.RenderDocumentView()),
+			)
+		default:
 			content = lipgloss.JoinVertical(lipgloss.Top,
 				m.RenderTabs(),
 				m.RenderTable(),
