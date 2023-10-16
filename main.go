@@ -516,13 +516,16 @@ func (m *Model) RenderDocumentView() string {
 		}
 		key := logoStyle.Render(colname)
 		val := strings.Map(func(r rune) rune {
-			if unicode.IsPrint(r) {
+			if unicode.IsPrint(r) || r == '\n' {
 				return r
 			}
 			return -1
 		}, string(r))
 		if val == "null" {
 			val = lipgloss.NewStyle().Foreground(lipgloss.Color("#474747")).Render(val)
+		} else {
+			coloredReturn := lipgloss.NewStyle().Foreground(lipgloss.Color("#e07a00")).Render("↵")
+			val = strings.ReplaceAll(val, "\\n", coloredReturn+"\n")
 		}
 		content.WriteString(fmt.Sprintf("%v%v : %v\n", key, strings.Repeat(" ", maxWidth-len(colname)), val))
 	}
