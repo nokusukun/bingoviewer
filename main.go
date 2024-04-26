@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	zone "github.com/lrstanley/bubblezone"
 	"github.com/muesli/reflow/wordwrap"
 	"github.com/nokusukun/bingo"
 	"github.com/sqweek/dialog"
@@ -240,6 +241,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.window.height = entle.Height()
 			cmd = tea.Batch(cmd, resizeTick())
 		}
+	case tea.MouseMsg:
+		if msg.Type != tea.MouseLeft {
+			break
+		}
+
+		for i := 0; i < len(m.collections); i++ {
+			if zone.Get(m.collections[i]).InBounds(msg) {
+				m.activeCollection = i
+				err := m.getData()
+				if err != nil {
+					m.Error(fmt.Sprintf("Failed to get columns: %v", err))
+				}
+				break
+			}
+		}
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keys.Up):
@@ -371,13 +387,12 @@ var (
 )
 
 func (m Model) RenderTabs() string {
-
 	var tabs strings.Builder
 	for i, coll := range m.collections {
 		if m.activeCollection == i {
-			tabs.WriteString(activeTabStyle.Render(fmt.Sprintf("%v", coll)))
+			tabs.WriteString(zone.Mark(coll, activeTabStyle.Render(coll)))
 		} else {
-			tabs.WriteString(tabStyle.Render(fmt.Sprintf("%v", coll)))
+			tabs.WriteString(zone.Mark(coll, tabStyle.Render(coll)))
 		}
 	}
 	return tabs.String()
@@ -645,11 +660,12 @@ func (m Model) View() string {
 	}
 	right.SetContent(accentStyle.Render(lipgloss.PlaceHorizontal(right.GetWidth()-5, lipgloss.Right, msg)))
 
-	return lipgloss.JoinVertical(lipgloss.Top, titleBorderStyle.Render(top.Render()), center.Render(), bottom.Render(), m.help.View(m.keys))
+	return zone.Scan(lipgloss.JoinVertical(lipgloss.Top, titleBorderStyle.Render(top.Render()), center.Render(), bottom.Render(), m.help.View(m.keys)))
 }
 
 func main() {
-	if _, err := tea.NewProgram(NewModel(), tea.WithAltScreen()).Run(); err != nil {
+	zone.NewGlobal()
+	if _, err := tea.NewProgram(NewModel(), tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		fmt.Printf("Could not start program :(\n%v\n", err)
 		os.Exit(1)
 	}
